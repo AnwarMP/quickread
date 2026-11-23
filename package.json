@@ -1,0 +1,52 @@
+{
+  "name": "quickread",
+  "version": "0.1.0",
+  "description": "A PDF reader for research papers with in-place term lookup and a local reading agent",
+  "main": "./out/main/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite build && electron .",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "package": "electron-vite build && electron-builder --mac dir"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^6.0.0",
+    "pdfjs-dist": "^6.5.438",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "build": {
+    "appId": "local.quickread.app",
+    "productName": "QuickRead",
+    "files": [
+      "out/**"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "target": "dir",
+      "icon": "build/icon.icns",
+      "category": "public.app-category.productivity",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "role": "Viewer"
+      }
+    ]
+  }
+}
