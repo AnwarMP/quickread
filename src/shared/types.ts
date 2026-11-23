@@ -49,6 +49,10 @@ export interface GlossaryTerm {
   error?: string
   /** True when the reader looked this up by hand rather than the indexer finding it. */
   manual?: boolean
+  /** Importance from the statistical ranking. */
+  score?: number
+  /** Other glossary terms this one builds on: the edges of the term graph. */
+  deps?: string[]
 }
 
 export interface Rect {
@@ -105,6 +109,8 @@ export interface DocState {
   bookmarks: Bookmark[]
   glossary: GlossaryTerm[]
   glossaryDone?: boolean
+  /** 2 = built by the statistical indexer. */
+  glossaryVersion?: number
   chat: ChatMessage[]
 }
 

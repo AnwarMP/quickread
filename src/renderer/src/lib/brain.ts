@@ -128,69 +128,57 @@ export async function mostRelevant<T>(query: string, items: T[], text: (item: T)
 
 // ---------- glossary ----------
 
-const GLOSSARY_SYSTEM = `You build the glossary for a research paper so a reader can look terms up while reading.
-List the technical terms, named concepts, methods, components, metrics, and acronyms that this paper introduces or relies on, and that a reader might forget and need to recall later.
-Rules:
-- Write each term exactly as it appears in the text, in singular form.
-- Put other surface forms that appear in the text (acronym, expansion, spelling variant) in "aliases".
-- Prefer concepts a reader must understand to follow the argument over incidental names of datasets, benchmarks, or tasks.
-- Skip everyday words, author names, dataset sizes, and section titles.
-- Return at most 30 terms.
-Answer with JSON only: {"terms":[{"term":"...","aliases":["..."]}]}`
+const PRUNE_SYSTEM = `You tidy an automatically extracted glossary for a research paper.
+You get a numbered list of candidate terms. Some are real technical terms or named concepts a reader may want explained. Others are noise: sentence fragments, generic phrases, names of organisations, hardware, or datasets mentioned in passing, and ordinary words.
+List the numbers of the noise entries. When unsure, keep the entry.
+Answer with JSON only: {"drop":[numbers]}`
 
-export async function extractGlossary(
-  index: DocIndex,
-  onProgress: (done: number, total: number) => void
-): Promise<GlossaryTerm[]> {
-  const body = index.chunks.filter((c) => !c.ref)
-  const windows: string[] = []
-  let cur = ''
-  for (const c of body) {
-    if (cur.length + c.text.length > 24000) {
-      windows.push(cur)
-      cur = ''
-    }
-    cur += `${c.section && !cur.includes(c.section) ? `\n## ${c.section}\n` : ''}${c.text}\n`
-  }
-  if (cur) windows.push(cur)
+/** One short model call that names the statistical extractor's false positives. */
+export async function pruneTerms(index: DocIndex, terms: GlossaryTerm[], id?: string): Promise<Set<string>> {
+  const raw = await chat(
+    [
+      { role: 'system', content: PRUNE_SYSTEM },
+      { role: 'user', content: `Paper: ${index.title}\n\n${terms.map((t, i) => `${i + 1}. ${t.term}`).join('\n')}` }
+    ],
+    { json: true, temperature: 0, id }
+  )
+  const drop = parseJson<{ drop?: unknown }>(raw)?.drop
+  const numbers = (Array.isArray(drop) ? drop : []).filter((n): n is number => Number.isInteger(n))
+  // A model that wants to drop most of the list has misread the task.
+  if (numbers.length > terms.length * 0.6) return new Set()
+  return new Set(numbers.map((n) => terms[n - 1]?.term).filter((t): t is string => !!t))
+}
 
-  const found = new Map<string, GlossaryTerm>()
-  for (let i = 0; i < windows.length; i++) {
-    onProgress(i, windows.length)
-    const raw = await chat(
-      [
-        { role: 'system', content: GLOSSARY_SYSTEM },
-        { role: 'user', content: `Paper: ${index.title}\n\n${windows[i]}` }
-      ],
-      { json: true, temperature: 0 }
-    )
-    const parsed = parseJson<{ terms?: { term?: unknown; aliases?: unknown }[] }>(raw)
-    for (const t of parsed?.terms ?? []) {
-      const term = typeof t.term === 'string' ? t.term.trim() : ''
-      if (term.length < 2 || term.length > 60 || term.split(/\s+/).length > 6) continue
-      const key = term.toLowerCase()
-      const aliases = (Array.isArray(t.aliases) ? t.aliases : [])
-        .filter((a): a is string => typeof a === 'string')
-        .map((a) => a.trim())
-        .filter((a) => a.length > 1 && a.length < 60 && a.toLowerCase() !== key)
-      const existing = found.get(key)
-      if (existing) {
-        existing.aliases = [...new Set([...existing.aliases, ...aliases])]
-        continue
+const SUMMARY_SYSTEM = `You help a reader recall what a term means in the paper they are reading.
+Write one or two plain sentences saying what the term means as this paper uses it. Start with the term itself.
+Use only the excerpts given. If they do not explain the term, say the paper uses it without defining it, then give its standard meaning.
+Output only the definition, with no preamble.`
+
+/**
+ * Writes a term's summary from its defining sentences and those of the terms it builds on.
+ * The prompt is a few hundred tokens, because the term graph has already found what matters.
+ */
+export async function summarizeTerm(
+  title: string,
+  term: string,
+  sentences: string[],
+  related: { term: string; quote: string }[],
+  onDelta: (text: string) => void
+): Promise<string> {
+  let acc = ''
+  const out = await chat(
+    [
+      { role: 'system', content: SUMMARY_SYSTEM },
+      {
+        role: 'user',
+        content: `Paper: ${title}\nTerm: ${term}\n\nWhere the paper introduces it:\n${sentences.map((s) => `- ${s}`).join('\n')}${
+          related.length ? `\n\nRelated terms it builds on:\n${related.map((r) => `- ${r.term}: ${r.quote}`).join('\n')}` : ''
+        }`
       }
-      // Keep only what really occurs in the paper, and only aliases that do too.
-      const real = aliases.filter((a) => mentionsOf(index, [a]).length > 0)
-      const mentions = mentionsOf(index, [term, ...real]).length
-      if (mentions > 0) found.set(key, { term, aliases: real, mentions, status: 'pending' })
-    }
-  }
-  onProgress(windows.length, windows.length)
-
-  // Drop a term whose name is already an alias of another one.
-  const aliasKeys = new Set([...found.values()].flatMap((t) => t.aliases.map((a) => a.toLowerCase())))
-  return [...found.values()]
-    .filter((t) => !aliasKeys.has(t.term.toLowerCase()))
-    .sort((a, b) => a.term.localeCompare(b.term))
+    ],
+    { temperature: 0, onDelta: (d) => onDelta((acc += d)) }
+  )
+  return out.trim()
 }
 
 // ---------- definitions ----------

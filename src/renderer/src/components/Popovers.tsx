@@ -75,6 +75,7 @@ export function TermCard(props: {
   onJump: (page: number, y?: number) => void
   onDeeper: (term: GlossaryTerm) => void
   onRetry: (term: GlossaryTerm) => void
+  onTerm: (name: string) => void
 }): ReactNode {
   const { term, index } = props
   const [full, setFull] = useState(false)
@@ -89,8 +90,10 @@ export function TermCard(props: {
         {term.aliases.length > 0 && <span className="muted">also: {term.aliases.join(', ')}</span>}
       </div>
 
-      {term.status === 'pending' && (
-        <p className="muted working">{props.llmOk ? 'Looking this up in the paper…' : 'The local model is not running, so there is no summary yet.'}</p>
+      {term.status === 'pending' && !term.summary && (
+        <p className="muted working">
+          {props.llmOk ? 'Writing a summary…' : 'The local model is not running, so there is no summary.'}
+        </p>
       )}
       {term.status === 'error' && (
         <p className="muted">
@@ -117,6 +120,17 @@ export function TermCard(props: {
           ) : (
             <p className="passage">{term.quote ? `“${term.quote.replace(/^["“]|["”]$/g, '')}”` : `${chunk.text.slice(0, 220)}…`}</p>
           )}
+        </div>
+      )}
+
+      {term.deps && term.deps.length > 0 && (
+        <div className="mentions">
+          <span className="label">Builds on</span>
+          {term.deps.map((d) => (
+            <button key={d} className="chip" onClick={() => props.onTerm(d)}>
+              {d}
+            </button>
+          ))}
         </div>
       )}
 

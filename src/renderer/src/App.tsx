@@ -15,16 +15,18 @@ import {
   chat,
   defineTerm,
   embedIndex,
-  extractGlossary,
   mentionsOf,
   mostRelevant,
   parseJson,
+  pruneTerms,
   refsNear,
   refTitle,
   retrieve,
+  summarizeTerm,
   termNames,
   uid
 } from './lib/brain'
+import { buildGlossary, dependencies, findDefinition } from './lib/terms'
 import { Sidebar, type SideTab } from './components/Sidebar'
 import { AgentPanel } from './components/AgentPanel'
 import { CiteCard, COLORS, HighlightCard, Popover, TermCard } from './components/Popovers'
@@ -65,7 +67,9 @@ export function App(): ReactNode {
   const settingsRef = useRef<Settings | null>(null)
   const run = useRef(0) // bumps whenever another document is opened
   const worker = useRef(0)
-  const priority = useRef<string | null>(null)
+  const pruneId = useRef<string | null>(null)
+  /** Terms whose summaries have been asked for, most recent first. */
+  const queue = useRef<string[]>([])
   const chatId = useRef<string | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -104,7 +108,45 @@ export function App(): ReactNode {
 
   // ---------- indexing ----------
 
-  /** Writes the summaries for pending glossary terms, one at a time, clicked term first. */
+  /**
+   * One background model call that removes the extractor's false positives. The term list is
+   * already in use, so this yields to the reader: opening a term cancels it, and it is tried
+   * again once the summaries they asked for are written.
+   */
+  const tidy = useCallback(
+    async (token: number): Promise<void> => {
+      const idx = indexRef.current
+      if (!idx || stateRef.current?.glossaryDone || pruneId.current || queue.current.length) return
+      const id = uid()
+      pruneId.current = id
+      setStatus('Tidying the term list…')
+      try {
+        const auto = (stateRef.current?.glossary ?? []).filter((t) => !t.manual && !t.summary)
+        const drop = await pruneTerms(idx, auto, id)
+        if (token !== run.current) return
+        update((st) => ({
+          ...st,
+          glossaryDone: true,
+          glossary: st.glossary
+            .filter((t) => !drop.has(t.term) || t.summary)
+            .map((t) => ({ ...t, deps: t.deps?.filter((d) => !drop.has(d)) }))
+        }))
+      } catch {
+        /* Cancelled or failed: the untidied list still works. */
+      } finally {
+        if (pruneId.current === id) pruneId.current = null
+        if (token === run.current) setStatus('')
+      }
+    },
+    [update]
+  )
+  const tidyRef = useRef(tidy)
+  tidyRef.current = tidy
+
+  /**
+   * Writes summaries for the terms the reader has opened, most recent first. The term's defining
+   * sentences and those of the terms it builds on are already known, so the prompt is tiny.
+   */
   const runWorker = useCallback(
     async (token: number): Promise<void> => {
       if (worker.current === token) return
@@ -112,23 +154,44 @@ export function App(): ReactNode {
       try {
         while (token === run.current) {
           const idx = indexRef.current
-          const pending = stateRef.current?.glossary.filter((t) => t.status === 'pending') ?? []
-          if (!idx || !pending.length) break
-          const next = pending.find((t) => t.term === priority.current) ?? pending[0]
-          setStatus(`Writing term summaries… ${pending.length} left`)
+          const name = queue.current.shift()
+          if (!idx || name === undefined) break
+          const all = stateRef.current?.glossary ?? []
+          const term = all.find((t) => t.term === name)
+          if (!term || term.status === 'ready') continue
           try {
-            const def = await defineTerm(idx, termNames(next))
-            if (token !== run.current) return
-            patchTerm(next.term, { status: 'ready', error: undefined, ...def })
+            const names = termNames(term)
+            const found = findDefinition(idx, names)
+            if (found) {
+              const related = (term.deps ?? [])
+                .map((d) => all.find((t) => t.term === d))
+                .filter((t): t is GlossaryTerm => !!t?.quote)
+                .slice(0, 4)
+                .map((t) => ({ term: t.term, quote: t.quote! }))
+              const summary = await summarizeTerm(
+                idx.title,
+                term.term,
+                found.sentences.map((s) => s.text),
+                related,
+                (text) => token === run.current && patchTerm(name, { summary: text })
+              )
+              if (token !== run.current) return
+              patchTerm(name, { status: 'ready', error: undefined, summary })
+            } else {
+              // Not mentioned verbatim anywhere: fall back to searching the paper by meaning.
+              const def = await defineTerm(idx, names)
+              if (token !== run.current) return
+              patchTerm(name, { status: 'ready', error: undefined, ...def })
+            }
           } catch (e) {
             if (token !== run.current) return
-            patchTerm(next.term, { status: 'error', error: e instanceof Error ? e.message : String(e) })
+            patchTerm(name, { status: 'error', error: e instanceof Error ? e.message : String(e) })
           }
         }
-        if (token === run.current) setStatus('')
       } finally {
         if (worker.current === token) worker.current = 0
       }
+      if (token === run.current) void tidyRef.current(token)
     },
     [patchTerm]
   )
@@ -156,24 +219,8 @@ export function App(): ReactNode {
           setError(`Passage embeddings are unavailable, using keyword search instead. ${e instanceof Error ? e.message : ''}`)
         }
       }
-      if (!stateRef.current?.glossaryDone) {
-        setStatus('Finding key terms…')
-        try {
-          const terms = await extractGlossary(idx, (done, total) =>
-            setStatus(total > 1 ? `Finding key terms… part ${Math.min(done + 1, total)} of ${total}` : 'Finding key terms…')
-          )
-          if (token !== run.current) return
-          update((st) => ({
-            ...st,
-            glossaryDone: true,
-            glossary: [...st.glossary.filter((m) => !terms.some((t) => sameTerm(t, m.term))), ...terms].sort((a, b) =>
-              a.term.localeCompare(b.term)
-            )
-          }))
-        } catch (e) {
-          setError(`Could not build the glossary. ${e instanceof Error ? e.message : String(e)}`)
-        }
-      }
+      await tidyRef.current(token)
+      setStatus('')
       void runWorker(token)
     },
     [runWorker, update]
@@ -206,6 +253,11 @@ export function App(): ReactNode {
         indexRef.current = idx
         setIndex(idx)
         const prev = res.state
+        // Key terms, their defining sentences, and the term graph come from text statistics, so
+        // they are ready as soon as the paper is. Terms the reader defined by hand are kept.
+        const current = prev?.glossaryVersion === 2
+        const built = current ? [] : buildGlossary(idx)
+        const kept = (prev?.glossary ?? []).filter((t) => current || (t.manual && !built.some((b) => sameTerm(b, t.term))))
         const st: DocState = {
           id: res.id,
           path,
@@ -214,8 +266,9 @@ export function App(): ReactNode {
           opened: Date.now(),
           highlights: prev?.highlights ?? [],
           bookmarks: prev?.bookmarks ?? [],
-          glossary: prev?.glossary ?? [],
-          glossaryDone: prev?.glossaryDone,
+          glossary: [...built, ...kept].sort((a, b) => a.term.localeCompare(b.term)),
+          glossaryDone: current ? prev?.glossaryDone : false,
+          glossaryVersion: 2,
           chat: (prev?.chat ?? []).map((m) => ({ ...m, pending: false, status: undefined }))
         }
         stateRef.current = st
@@ -292,13 +345,29 @@ export function App(): ReactNode {
       if (!st || !idx) return
       let term = st.glossary.find((t) => sameTerm(t, name))
       if (!term) {
-        term = { term: name, aliases: [], mentions: mentionsOf(idx, [name]).length, status: 'pending', manual: true }
+        // A phrase the reader selected: find where the paper defines it right away.
+        const found = findDefinition(idx, [name])
+        term = {
+          term: name,
+          aliases: [],
+          mentions: found?.mentions ?? 0,
+          status: 'pending',
+          manual: true,
+          quote: found?.quote,
+          chunkId: found?.chunkId,
+          deps: dependencies([name], found?.quote, st.glossary)
+        }
         const added = term
         update((s) => ({ ...s, glossary: [...s.glossary, added].sort((a, b) => a.term.localeCompare(b.term)) }))
       } else if (term.status === 'error') {
         patchTerm(term.term, { status: 'pending', error: undefined })
       }
-      priority.current = term.term
+      const wanted = term.term
+      if (term.status !== 'ready') {
+        queue.current = [wanted, ...queue.current.filter((n) => n !== wanted)]
+        // The reader comes first: stop background tidying so the model is free for this summary.
+        if (pruneId.current) void window.qr.abort(pruneId.current)
+      }
       setSelection(null)
       setPop({ kind: 'term', term: term.term, at })
       void runWorker(run.current)
@@ -575,7 +644,12 @@ Then add a short section under the heading line "### Where to read more" that sa
     setShowSettings(false)
     setError('')
     if (reindex && stateRef.current) {
-      update((s) => ({ ...s, glossaryDone: false, glossary: s.glossary.filter((t) => t.manual).map((t) => ({ ...t, status: 'pending' as const })) }))
+      const idx = indexRef.current
+      update((s) => {
+        const built = idx ? buildGlossary(idx) : []
+        const manual = s.glossary.filter((t) => t.manual && !built.some((b) => sameTerm(b, t.term)))
+        return { ...s, glossaryDone: false, glossary: [...built, ...manual].sort((a, b) => a.term.localeCompare(b.term)) }
+      })
     }
     if (stateRef.current) await runIndexing(run.current)
     else setLlm(await window.qr.llmStatus())
@@ -771,6 +845,7 @@ Then add a short section under the heading line "### Where to read more" that sa
               onJump={jump}
               onDeeper={(t) => void deepDive(t)}
               onRetry={(t) => openTerm(t.term, pop.at)}
+              onTerm={(name) => openTerm(name, pop.at)}
             />
           )}
           {popRef && <CiteCard reference={popRef} onJump={jump} onOpenPdf={(u) => void openFromWeb(u)} />}

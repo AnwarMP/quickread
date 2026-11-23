@@ -66,9 +66,8 @@ export function Sidebar(props: {
                     <button onClick={(e) => props.onTerm(t, e.currentTarget)}>
                       <span className="grow">
                         <span className="term-name">{t.term}</span>
-                        {t.summary && <span className="term-sum">{t.summary}</span>}
+                        {(t.summary ?? t.quote) && <span className="term-sum">{t.summary ?? t.quote}</span>}
                       </span>
-                      {t.status === 'pending' && <span className="dot" title="Summary not written yet" />}
                     </button>
                   </li>
                 ))}
@@ -79,7 +78,7 @@ export function Sidebar(props: {
                   ? 'No terms match.'
                   : state.glossaryDone
                     ? 'No terms were found. Select any text and choose Define.'
-                    : 'Terms appear here once the paper has been indexed. You can also select any text and choose Define.'}
+                    : 'No key terms were found. Select any text and choose Define.'}
               </p>
             )}
           </>
